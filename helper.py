@@ -25,6 +25,8 @@ from sklearn.metrics import roc_auc_score, accuracy_score, \
 balanced_accuracy_score, confusion_matrix, roc_curve, auc, \
 precision_recall_fscore_support
 
+from npr import *
+
 colors = ['r', 'g', 'b', 'c', 'k', 'y','m', 'c','r','g','b']
 
 
@@ -33,7 +35,7 @@ colors = ['r', 'g', 'b', 'c', 'k', 'y','m', 'c','r','g','b']
 #############################
 
 def test(testloader, net, criterion, device, acc_arr=None, \
-    avg_auc=None, global_=False, FCA_=False, label_binarizer=None, NUM_CLASS=0):
+    avg_auc=None, label_binarizer=None, NUM_CLASS=0):
     net.eval()
     test_loss = 0
     probs, labels, preds =  [], [] ,[]
@@ -41,21 +43,16 @@ def test(testloader, net, criterion, device, acc_arr=None, \
         for batch_idx, (inputs, targets, order, one_hot) in enumerate(testloader):
             targets = targets.type(torch.LongTensor)
             inputs, targets = inputs.to(device), targets.to(device)
-            if FCA_:
-                y1,y2 = net(inputs)
-            else:
-                y1 = net(inputs)
-            outputs = y1
             
+            y = net(inputs)
+            outputs = y
             loss = criterion(outputs, targets)
             test_loss += loss.item()
-            y1 = F.softmax(y1,dim=1)
-            _, predicted = y1.max(1)
             
-            if FCA_ and global_:
-                y2 = F.softmax(y2,dim=1)
-                _, predicted = y2.max(1)
-                outputs = y2
+            y = F.softmax(y,dim=1)
+            _, predicted = y.max(1)
+
+            outputs = y
             
             predicts = predicted.cpu().detach().numpy()
             label = targets.cpu().detach().numpy()
@@ -94,40 +91,54 @@ def test(testloader, net, criterion, device, acc_arr=None, \
     if avg_auc is not None:
         avg_auc.append(np.sum(np.array(auc_))/len(cls))
 
+
+
 #####
 def train(trainloader, net, optimizer, criterion, device, \
-          acc_arr=None, loss_arr=None, FCA_=False, FCA_PARAMS=None):
+          acc_arr=None, loss_arr=None, \
+          NPR_REG = False, LAMBDA_=0.05, prototypes_=None):
     net.train()
     train_loss = 0
     labels, preds, probs = [], [], []
     
-    kld = nn.KLDivLoss().to(device)
+    criterion_npr = nn.CrossEntropyLoss().to(device)
     for batch_idx, (inputs, targets, order, one_hot) in \
     enumerate(trainloader):
+        BATCH = inputs.shape[0]
         targets = targets.type(torch.LongTensor)
         inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        if FCA_:
-            LAM1, LAM2, CONSISTENCY = FCA_PARAMS['LAM1'], FCA_PARAMS['LAM2'], FCA_PARAMS['CONSISTENCY']
-            y1,y2 = net(inputs)
-            l1, l2 = criterion(y1, targets), criterion(y2, targets)
-            l1, l2 = torch.mean(l1), torch.mean(l2)  
-            y1 = F.softmax(y1, dim=1)
-            y2 = F.softmax(y2, dim=1)
-            # update only the y2 since that's the head we regularize
-            kloss = kld(y1+1e-11, y2.detach()+1e-11)
-            loss = LAM1*l1 + LAM2*l2 + CONSISTENCY*kloss
-            
-            y = y2
+        
+        y = net(inputs)
+        l1 = criterion(y, targets)
+        l1 = torch.mean(l1)
+        
+        if prototypes_ == None:
+            NPR_REG = False
+        
+        if NPR_REG:
+            feats = net.features(inputs)
+            feats = net.avgpool(feats)
+            feats_reshaped = feats.view(BATCH, -1)
+            fnorm = F.normalize(feats_reshaped, p=2, dim=-1)
+            prots_data = F.normalize(prototypes_.prototypes.\
+                                     data, p=2, dim=-1)
+            projected_features = torch.einsum('nd,ckd-> nkc', fnorm,\
+                                      prots_data)
+            out_logits = torch.amax(projected_features,dim=1)
+            num_classes = out_logits.shape[-1]
+            tmp_ = nn.LayerNorm(num_classes).to(out_logits.device)
+            out_logits = tmp_(out_logits)
+            npr_loss = criterion_npr(out_logits, targets)
+        
+        if NPR_REG:
+            loss = l1 + LAMBDA_+npr_loss
         else:
-            y1 = net(inputs)
-            l1 = criterion(y1, targets)
-            l1 = torch.mean(l1)
             loss = l1
-            
-            y = y1
+        
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
         ###############################
         outputs = y # use bsm
         train_loss += loss.item()
@@ -148,6 +159,57 @@ def train(trainloader, net, optimizer, criterion, device, \
     if loss_arr is not None:
         loss_arr.append((train_loss/(batch_idx+1)))
 
+'''
+update centroids
+'''
+def update_prototype(trainloader, net, prototype_, device,embed=1280):
+    num_data = len(trainloader.dataset)
+    client_feats = torch.zeros((num_data,embed))
+    client_labels = torch.zeros((num_data))
+
+    idx = 0
+    for inputs, targets, order, one_hot in trainloader:
+        BATCH = inputs.shape[0]
+        client_labels[idx:idx+BATCH] = targets    
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        with torch.no_grad():
+            feats = net.features(inputs)
+            feats = net.avgpool(feats)
+            feats_reshaped = feats.view(BATCH,-1)
+            # normalize feats
+            fnorm = F.normalize(feats_reshaped, p=2, dim=-1)
+
+        prots_data = F.normalize(prototype_.prototypes.\
+                                 data, p=2, dim=-1)
+        client_feats[idx:idx+BATCH,...] = fnorm.cpu()
+        idx += BATCH    
+
+    projected_features = torch.einsum('nd,ckd-> nkc', client_feats,\
+                                      prots_data.cpu())
+    out_logits = torch.amax(projected_features,dim=1) # take max centroid
+    # normalize
+    num_classes = out_logits.shape[-1]
+    tmp_ = nn.LayerNorm(num_classes).to(out_logits.device)
+    out_logits = tmp_(out_logits)
+    # update centroids
+    for c in range(num_classes):
+        clusters_of_interest = projected_features[..., c]
+        clusters_of_interest = clusters_of_interest[client_labels == c]
+        input_features =  client_feats[client_labels == c]
+
+        if clusters_of_interest.shape[0] <= 1:
+            continue
+
+        q, cluster_index = AGD_torch_no_grad_gpu(clusters_of_interest)
+        feature_prototype = q.T @ input_features
+        num_samples = torch.sum(q, dim=0)
+        prots_data[c,...] = feature_prototype / (num_samples+1e-10).unsqueeze(-1)
+        prototype_.update_proto(prots_data.to(device))
+        
+    
+            
+        
 
 ######################################################
 # Federated learning related function and helper #####
